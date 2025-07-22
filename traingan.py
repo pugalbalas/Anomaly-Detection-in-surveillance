@@ -1,119 +1,113 @@
-import cv2
+import os
+import glob
 import numpy as np
 import tensorflow as tf
-from tensorflow.keras.models import load_model
-import os
-import threading
-import matplotlib.pyplot as plt
-from collections import deque
+from tensorflow.keras.layers import Dense, Flatten, Reshape, Conv2D, Conv2DTranspose, LeakyReLU, Dropout
+from tensorflow.keras.models import Sequential, Model
+from tensorflow.keras.optimizers import Adam
 
-# Check if GPU is available and configure it for TensorFlow
-gpus = tf.config.experimental.list_physical_devices('GPU')
-if gpus:
-    try:
-        for gpu in gpus:
-            tf.config.experimental.set_memory_growth(gpu, True)
-        print("✅ Using GPU for processing.")
-    except RuntimeError as e:
-        print(f"⚠️ GPU setup error: {e}")
-else:
-    print("❌ No GPU found. Running on CPU.")
+# Set parameters
+IMG_SIZE = 64
+CHANNELS = 3
+LATENT_DIM = 100
+BATCH_SIZE = 32
+EPOCHS = 30
+SAVE_INTERVAL = 500
+SAVE_DIR = "processed_"
+MODEL_SAVE_PATH = "gan_model.h5"
 
-# Load the pre-trained GAN generator
-MODEL_PATH = "gan_model.h5"
-generator = load_model(MODEL_PATH)
+os.makedirs(SAVE_DIR, exist_ok=True)
 
-# System configuration
-LATENT_DIM = 100                           # Size of noise vector for GAN
-THRESHOLD = 0.5                            # Anomaly detection threshold
-FRAME_SIZE = (64, 64)                      # Resize frames to GAN input size
-ANOMALY_SCORES = deque(maxlen=50)          # Store last 50 anomaly scores for visualization
-
-# Resize and normalize input frame for GAN comparison
-def preprocess_frame(frame):
-    frame = cv2.resize(frame, FRAME_SIZE)
-    frame = frame.astype(np.float32) / 255.0
-    return np.expand_dims(frame, axis=0)
-
-# Use GAN to generate a synthetic image from random noise
-def generate_synthetic_image():
-    noise = np.random.normal(0, 1, (1, LATENT_DIM))
-    generated_image = generator.predict(noise)[0]
-    return np.clip(generated_image, 0, 1)
-
-# Compare the real frame with the generated image to detect anomaly
-def detect_anomaly(real_frame):
-    synthetic_image = generate_synthetic_image()
-    real_frame = np.squeeze(real_frame)
-    difference = np.mean(np.abs(real_frame - synthetic_image))
-    return difference > THRESHOLD, difference
-
-# Continuously update and display a live plot of anomaly scores
-def plot_anomaly_score():
-    plt.ion()
-    fig, ax = plt.subplots()
+# Load dataset
+def load_images(dataset_path):
+    image_files = glob.glob(os.path.join(dataset_path, "*.jpg"))  # Load all .jpg files
+    if len(image_files) == 0:
+        raise ValueError(f"No images found in the dataset path: {dataset_path}")
     
-    while True:
-        if len(ANOMALY_SCORES) > 0:
-            ax.clear()
-            above_threshold = [score if score > THRESHOLD else None for score in ANOMALY_SCORES]
-            below_threshold = [score if score <= THRESHOLD else None for score in ANOMALY_SCORES]
+    dataset = tf.data.Dataset.from_tensor_slices(image_files)
+    
+    def load_and_preprocess(image_path):
+        image = tf.io.read_file(image_path)
+        image = tf.image.decode_jpeg(image, channels=3)
+        image = tf.image.resize(image, (IMG_SIZE, IMG_SIZE)) / 255.0
+        return image
+    
+    dataset = dataset.map(load_and_preprocess).batch(BATCH_SIZE)
+    return dataset
+
+# Build Generator
+def build_generator():
+    model = Sequential([
+        Dense(8 * 8 * 256, input_dim=LATENT_DIM),
+        Reshape((8, 8, 256)),
+        Conv2DTranspose(128, (4, 4), strides=2, padding='same', activation='relu'),
+        Conv2DTranspose(64, (4, 4), strides=2, padding='same', activation='relu'),
+        Conv2DTranspose(CHANNELS, (4, 4), strides=2, padding='same', activation='tanh')
+    ])
+    return model
+
+# Build Discriminator
+def build_discriminator():
+    model = Sequential([
+        Conv2D(64, (4, 4), strides=2, padding='same', input_shape=(IMG_SIZE, IMG_SIZE, CHANNELS)),
+        LeakyReLU(alpha=0.2),
+        Dropout(0.3),
+        Conv2D(128, (4, 4), strides=2, padding='same'),
+        LeakyReLU(alpha=0.2),
+        Dropout(0.3),
+        Flatten(),
+        Dense(1, activation='sigmoid')
+    ])
+    return model
+
+# Compile GAN
+def build_gan(generator, discriminator):
+    discriminator.compile(loss='binary_crossentropy', optimizer=Adam(0.0002, 0.5), metrics=['accuracy'])
+    discriminator.trainable = False
+    gan_input = tf.keras.Input(shape=(LATENT_DIM,))
+    generated_image = generator(gan_input)
+    gan_output = discriminator(generated_image)
+    gan = Model(gan_input, gan_output)
+    gan.compile(loss='binary_crossentropy', optimizer=Adam(0.0002, 0.5))
+    return gan
+
+# Train GAN
+def train(dataset_path):
+    dataset = load_images(dataset_path)
+    generator = build_generator()
+    discriminator = build_discriminator()
+    gan = build_gan(generator, discriminator)
+
+    real_labels = np.ones((BATCH_SIZE, 1))
+    fake_labels = np.zeros((BATCH_SIZE, 1))
+
+    for epoch in range(EPOCHS):
+        for real_images in dataset:
+            batch_size = real_images.shape[0]
+            noise = np.random.normal(0, 1, (batch_size, LATENT_DIM))
+            fake_images = generator.predict(noise)
             
-            ax.plot(above_threshold, color='red', marker='o', linestyle='dashed', label='Above Threshold')
-            ax.plot(below_threshold, color='green', marker='o', linestyle='dashed', label='Below Threshold')
-            ax.axhline(y=THRESHOLD, color='blue', linestyle='--', linewidth=1.5, label='Anomaly Threshold')
+            d_loss_real = discriminator.train_on_batch(real_images, real_labels[:batch_size])
+            d_loss_fake = discriminator.train_on_batch(fake_images, fake_labels[:batch_size])
+            d_loss = 0.5 * np.add(d_loss_real, d_loss_fake)
             
-            ax.set_ylim([0.2, 0.8])
-            ax.set_title("Anomaly Score Over Time")
-            ax.set_xlabel("Frame")
-            ax.set_ylabel("Anomaly Score")
-            ax.legend()
-            plt.pause(0.1)
+            noise = np.random.normal(0, 1, (batch_size, LATENT_DIM))
+            g_loss = gan.train_on_batch(noise, real_labels[:batch_size])
 
-# Launch anomaly score graph in a separate thread
-graph_thread = threading.Thread(target=plot_anomaly_score, daemon=True)
-graph_thread.start()
+        if epoch % SAVE_INTERVAL == 0:
+            print(f"Epoch {epoch}: D Loss: {d_loss[0]}, G Loss: {g_loss}")
+            save_generated_images(generator, epoch)
+    
+    generator.save(MODEL_SAVE_PATH)
 
-# Start capturing video from the webcam
-cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+# Save generated images
+def save_generated_images(generator, epoch):
+    noise = np.random.normal(0, 1, (1, LATENT_DIM))
+    gen_image = generator.predict(noise)[0]
+    gen_image = (gen_image * 127.5 + 127.5).astype(np.uint8)
+    img_path = os.path.join(SAVE_DIR, f"generated_{epoch}.png")
+    tf.keras.utils.save_img(img_path, gen_image)
 
-if not cap.isOpened():
-    print("Error: Could not access the webcam.")
-    exit()
-
-while True:
-    ret, frame = cap.read()
-    if not ret:
-        print("Error: Failed to capture frame.")
-        break
-
-    # Prepare frame for GAN comparison
-    processed_frame = preprocess_frame(frame)
-
-    # Perform anomaly detection
-    is_anomaly, score = detect_anomaly(processed_frame)
-    ANOMALY_SCORES.append(score)
-
-    # Set message and box color based on detection result
-    if is_anomaly:
-        text = f"Anomaly Detected! Score: {score:.2f}"
-        color = (0, 0, 255)  # Red
-    else:
-        text = f"Normal. Score: {score:.2f}"
-        color = (0, 255, 0)  # Green
-
-    # Draw bounding box and display result on frame
-    height, width, _ = frame.shape
-    cv2.rectangle(frame, (50, 50), (width - 50, height - 50), color, 3)
-    cv2.putText(frame, text, (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2)
-
-    # Show video with overlay
-    cv2.imshow("Webcam Feed", frame)
-
-    # Exit on pressing 'q'
-    if cv2.waitKey(1) & 0xFF == ord('q'):
-        break
-
-# Clean up resources
-cap.release()
-cv2.destroyAllWindows()
+if __name__ == "_main_":
+    dataset_path = "./processed_test_img"  # Change this to your dataset folder
+    train(dataset_path)
